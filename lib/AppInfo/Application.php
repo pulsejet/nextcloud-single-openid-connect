@@ -6,6 +6,7 @@ namespace OCA\OIDCLogin\AppInfo;
 
 use OC\AppFramework\Utility\ControllerMethodReflector;
 use OCA\OIDCLogin\OIDCLoginOption;
+use OCA\OIDCLogin\Service\TokenService;
 use OCP\AppFramework\App;
 use OCP\AppFramework\Bootstrap\IBootContext;
 use OCP\AppFramework\Bootstrap\IBootstrap;
@@ -29,6 +30,10 @@ class Application extends App implements IBootstrap
 
     /** @var Config */
     protected $config;
+
+    /** @var TokenService */
+    private $tokenService;
+
     private $appName = 'oidc_login';
 
     public function __construct()
@@ -75,6 +80,7 @@ class Application extends App implements IBootstrap
         $this->l = $container->query(IL10N::class);
         $this->url = $container->query(IURLGenerator::class);
         $this->config = $container->query(IConfig::class);
+        $this->tokenService = $container->query(TokenService::class);
         $request = $container->query(IRequest::class);
 
         // Check if automatic redirection is enabled
@@ -100,9 +106,18 @@ class Application extends App implements IBootstrap
             // Disable password confirmation for user
             $session->set('last-password-confirm', $container->query(ITimeFactory::class)->getTime());
 
+            $refreshTokensEnabled = $session->exists('oidc_refresh_tokens_enabled');
             /* Redirect to logout URL on completing logout
                If do not have logout URL, go to noredir on logout */
             if ($logoutUrl = $session->get('oidc_logout_url', $noRedirLoginUrl)) {
+                $userSession->listen('\OC\User', 'logout', function () use (&$logoutUrl, $refreshTokensEnabled, $session) {
+                    if ($refreshTokensEnabled) {
+                        // Refresh tokens before logout
+                        $this->tokenService->refreshTokens();
+                        $logoutUrl = $session->get('oidc_logout_url');
+                    }
+                });
+
                 $userSession->listen('\OC\User', 'postLogout', function () use ($logoutUrl, $session) {
                     // Do nothing if this is a CORS request
                     if ($this->getContainer()->query(ControllerMethodReflector::class)->hasAnnotation('CORS')) {
@@ -119,6 +134,17 @@ class Application extends App implements IBootstrap
 
                     exit;
                 });
+            }
+
+            if ($refreshTokensEnabled && !$this->tokenService->refreshTokens()) {
+                // See if session is active if autologin is enabled; else logout
+                if ($useLoginRedirect) {
+                    $loginLink = OIDCLoginOption::getLoginLink($request, $this->url);
+                    header('Location: '.$loginLink);
+
+                    exit;
+                }
+                $userSession->logout();
             }
 
             // Hide password change form

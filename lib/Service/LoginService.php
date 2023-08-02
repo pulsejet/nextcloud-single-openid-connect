@@ -4,7 +4,6 @@ namespace OCA\OIDCLogin\Service;
 
 use OC\Authentication\Token\IProvider;
 use OC\User\LoginException;
-use OCA\OIDCLogin\Provider\OpenIDConnectClient;
 use OCP\IAvatarManager;
 use OCP\IConfig;
 use OCP\IGroupManager;
@@ -73,26 +72,6 @@ class LoginService
         $this->logger = $logger;
         $this->storagesService = $storagesService;
         $this->attr = new AttributeMap($config);
-    }
-
-    public function createOIDCClient($callbackUrl = '')
-    {
-        $oidc = new OpenIDConnectClient(
-            $this->session,
-            $this->config,
-            $this->appName,
-        );
-        $oidc->setRedirectURL($callbackUrl);
-
-        // set TLS development mode
-        $oidc->setVerifyHost($this->config->getSystemValue('oidc_login_tls_verify', true));
-        $oidc->setVerifyPeer($this->config->getSystemValue('oidc_login_tls_verify', true));
-
-        // Set OpenID Connect Scope
-        $scope = $this->config->getSystemValue('oidc_login_scope', 'openid');
-        $oidc->addScope($scope);
-
-        return $oidc;
     }
 
     public function login($profile, $userSession, $request)
@@ -215,9 +194,9 @@ class LoginService
      *
      * @param null|string $ldapUid
      *
-     * @return null|string LDAP user uid or null if not found
-     *
      * @throws LoginException if LDAP backend is not enabled or user is not found
+     *
+     * @return null|string LDAP user uid or null if not found
      */
     private function getLDAPUserUid($ldapUid)
     {
@@ -276,9 +255,9 @@ class LoginService
      * @param string $uid
      * @param string $password
      *
-     * @return false|\OCP\IUser User object if created
-     *
      * @throws LoginException If oidc_login_disable_registration is true
+     *
+     * @return false|\OCP\IUser User object if created
      */
     private function createUser($uid, $password)
     {

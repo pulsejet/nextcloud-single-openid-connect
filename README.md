@@ -56,19 +56,23 @@ $CONFIG = array (
     'oidc_login_use_id_token' => false,
 
     // Attribute map for OIDC response. Available keys are:
-    //   * id:       Unique identifier for username
-    //   * name:     Full name
-    //                  If set to null, existing display name won't be overwritten
-    //   * mail:     Email address
-    //                  If set to null, existing email address won't be overwritten
-    //   * quota:    Nextcloud storage quota
-    //   * home:     Home directory location. A symlink or external storage to this location is used
-    //   * ldap_uid: LDAP uid to search for when running in proxy mode
-    //   * groups:   Array or space separated string of NC groups for the user
-    //   * photoURL: The URL of the user avatar. The nextcloud server will download the picture
-    //                  at user login. This may lead to security issues. Use with care.
-    //                  This will only be effective if oidc_login_update_avatar is enabled.
-    //   * is_admin: If this value is truthy, the user is added to the admin group (optional)
+    //   * id:           Unique identifier for username
+    //   * name:         Full name
+    //                      If set to null, existing display name won't be overwritten
+    //   * mail:         Email address
+    //                      If set to null, existing email address won't be overwritten
+    //   * quota:        Nextcloud storage quota
+    //   * home:         Home directory location. A symlink or external storage to this location is used
+    //   * ldap_uid:     LDAP uid to search for when running in proxy mode
+    //   * groups:       Array or space separated string of Nextcloud groups for the user.
+    //                   Note that the name here corresponds to the GID of the group and not the display name
+    //                   In the admin panel, the GID may be obtained from the URL when editing a group
+    //   * login_filter: Array or space separated string. If 'oidc_login_filter_allowed_values' is
+    //                      set, it is checked against these values.
+    //   * photoURL:     The URL of the user avatar. The nextcloud server will download the picture
+    //                      at user login. This may lead to security issues. Use with care.
+    //                      This will only be effective if oidc_login_update_avatar is enabled.
+    //   * is_admin:     If this value is truthy, the user is added to the admin group (optional)
     //
     // The attributes in the OIDC response are flattened by adding the nested
     // array key as the prefix and an underscore. Thus,
@@ -111,6 +115,7 @@ $CONFIG = array (
         'home' => 'homeDirectory',
         'ldap_uid' => 'uid',
         'groups' => 'ownCloudGroups',
+        'login_filter' => 'realm_access_roles',
         'photoURL' => 'picture',
         'is_admin' => 'ownCloudAdmin',
     ),
@@ -118,6 +123,9 @@ $CONFIG = array (
     // Default group to add users to (optional, defaults to nothing)
     'oidc_login_default_group' => 'oidc',
 
+    // DEPRECATED: This option will be removed in a future release. Use
+    // 'login_filter' and 'oidc_login_filter_allowed_values' instead.
+    //
     // Allow only users in configured group(s) to access Nextcloud. In case the user
     // is not assigned to this group (read from oidc_login_attributes) the login
     // will not be allowed for this user.
@@ -125,6 +133,14 @@ $CONFIG = array (
     // Must be specified as an array of groups that are allowed to access Nextcloud.
     // e.g. 'oidc_login_allowed_groups' => array('group1', 'group2')
     'oidc_login_allowed_groups' => null,
+
+    // Allow only users in configured value(s) to access Nextcloud. In case the user
+    // is not assigned to this value (read from oidc_login_attributes) the login
+    // will not be allowed for this user.
+    //
+    // Must be specified as an array of values (e.g. roles) that are allowed to
+    // access Nextcloud. e.g. 'oidc_login_filter_allowed_values' => array('role1', 'role2')
+    'oidc_login_filter_allowed_values' => null,
 
     // Use external storage instead of a symlink to the home directory
     // Requires the files_external app to be enabled
@@ -159,12 +175,12 @@ $CONFIG = array (
 
     // Use an alternative login page
     // This page will be php-included instead of a redirect if specified
-    // In the example below, the PHP file `login.php` in `assets`
-    // in nextcloud base directory will be included
+    // For example, setting it to `assets/login.php` will use that file
+    // in the nextcloud base directory
     // Note: the PHP variable $OIDC_LOGIN_URL is available for redirect URI
     // Note: you may want to try setting `oidc_login_logout_url` to your
     // base URL if you face issues regarding re-login after logout
-    'oidc_login_alt_login_page' => 'assets/login.php',
+    'oidc_login_alt_login_page' => false,
 
     // For development, you may disable TLS verification. Default value is `true`
     // which should be kept in production
@@ -203,7 +219,7 @@ $CONFIG = array (
     // The default is false.
     'oidc_login_skip_proxy' => false,
 
-    // Code challenge method for PKCE flow. 
+    // Code challenge method for PKCE flow.
     // Possible values are:
     //	- 'S256'
     //	- 'plain'
@@ -267,3 +283,21 @@ Thus, the login would fail. The following steps ensure, that access tokens obtai
 1. Add new client scope, call it `nextcloud`.
 1. Under `Mappers` create a new mapper of type `Audience` and ensure that `Included Client Audience` contains your Nextcloud client. Click Save.
 1. Finally, go to `Client > your-client-to-obtain-access-token > Client Scopes` and add the new `nextcloud` scope.
+
+### Login Filter
+
+The login filter feature allows to allow/deny access to nextcloud to users based on roles or similar claims. Use the `login_filter` in `oidc_login_attributes` to define, which claim holds the roles/permissions. For Keycloak this could be for example:
+
+```
+'login_filter' => 'realm_access_roles'
+```
+
+ Use `oidc_login_filter_allowed_values` to set, which roles/groups/whatever have access, eg.:
+
+```
+'oidc_login_filter_allowed_values' => array('nextcloudRole')
+```
+
+The login filter feature will replace the deprecated `oidc_login_allowed_groups`, as this was limited to using groups for access control. If you want to use a group as login filter you can still achieve the same by setting `login_filter` to your groups claim and setting a corresponding `oidc_login_filter_allowed_values`.
+
+

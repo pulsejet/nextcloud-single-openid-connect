@@ -3,78 +3,80 @@
 namespace OCA\OIDCLogin\Service;
 
 use OC\Authentication\Token\IProvider;
+use OCA\OIDCLogin\Provider\OpenIDConnectClient;
 use OC\User\LoginException;
 use OCP\IAvatarManager;
 use OCP\IConfig;
 use OCP\IGroupManager;
 use OCP\IL10N;
-use OCP\ISession;
+use OCP\IRequest;
+use OCP\IUser;
 use OCP\IUserManager;
+use OCP\IUserSession;
 use Psr\Log\LoggerInterface;
 
 class LoginService
 {
     public const USER_AGENT = 'NextcloudOIDCLogin';
 
-    /** @var string */
-    private $appName;
-
-    /** @var IAvatarManager */
-    private $avatarManager;
-
-    /** @var IConfig */
-    private $config;
-
-    /** @var IUserManager */
-    private $userManager;
-
-    /** @var IGroupManager */
-    private $groupManager;
-
-    /** @var ISession */
-    private $session;
-
-    /** @var IL10N */
-    private $l;
-
-    /** @var IProvider */
-    private $tokenProvider;
-
-    /** @var LoggerInterface */
-    private $logger;
-
-    /** @var \OCA\Files_External\Service\GlobalStoragesService */
-    private $storagesService;
-
-    /** @var AttributeMap attribute map */
+    private IAvatarManager $avatarManager;
+    private IConfig $config;
+    private IRequest $request;
+    private IUserManager $userManager;
+    private IGroupManager $groupManager;
+    private IL10N $l;
+    private IProvider $tokenProvider;
+    private LoggerInterface $logger;
     private AttributeMap $attr;
 
     public function __construct(
-        $appName,
         IConfig $config,
+        IRequest $request,
         IUserManager $userManager,
         IAvatarManager $avatarManager,
         IGroupManager $groupManager,
-        ISession $session,
         IL10N $l,
         IProvider $tokenProvider,
         LoggerInterface $logger,
-        $storagesService
+        AttributeMap $attr
     ) {
-        $this->appName = $appName;
         $this->config = $config;
+        $this->request = $request;
         $this->userManager = $userManager;
         $this->avatarManager = $avatarManager;
         $this->groupManager = $groupManager;
-        $this->session = $session;
         $this->l = $l;
         $this->tokenProvider = $tokenProvider;
         $this->logger = $logger;
-        $this->storagesService = $storagesService;
-        $this->attr = new AttributeMap($config);
+        $this->attr = $attr;
+
+        // get external storage service if available
+        $this->storagesService = class_exists('\OCA\Files_External\Service\GlobalStoragesService') ?
+            \OC::$server->get(\OCA\Files_External\Service\GlobalStoragesService::class) : null;
     }
 
-    public function login($profile, $userSession, $request)
+    public function createOIDCClient(string $callbackUrl = ''): OpenIDConnectClient
+    {
+        $oidc = \OC::$server->get(OpenIDConnectClient::class);
+        $oidc->setRedirectURL($callbackUrl);
+
+        // set TLS development mode
+        $oidc->setVerifyHost($this->config->getSystemValue('oidc_login_tls_verify', true));
+        $oidc->setVerifyPeer($this->config->getSystemValue('oidc_login_tls_verify', true));
+
+        // Set OpenID Connect Scope
+        $scope = $this->config->getSystemValue('oidc_login_scope', 'openid');
+        $oidc->addScope($scope);
+
+        return $oidc;
+    }
+
+    /**
+     * Log in the user using the provided profile.
+     *
+     * @return array [\OCP\IUser user, string password]
+     */
+    public function login(array $profile): array
     {
         // Flatten the profile array
         $profile = $this->flatten($profile);
@@ -98,6 +100,7 @@ class LoginService
             $uid = md5($uid);
         }
 
+        // DEPRECATED: This code can be removed once the 'oidc_login_allowed_groups' feature is removed
         // Check if user is in allowed groups
         if ($allowedGroups = $this->config->getSystemValue('oidc_login_allowed_groups', null)) {
             $groupNames = $this->getGroupNames($profile);
@@ -106,13 +109,29 @@ class LoginService
             }
         }
 
+        // Check if user has an allowed login filter value
+        if ($allowedLoginFilterValues = $this->config->getSystemValue('oidc_login_filter_allowed_values', null)) {
+            $loginFilterValues = $this->getLoginFilterValues($profile);
+            if (empty(array_intersect($allowedLoginFilterValues, $loginFilterValues))) {
+                throw new LoginException($this->l->t('Access to this service is not allowed because you do not have one of the allowed login filter values. If you think this is an error, contact your administrator.'));
+            }
+        }
+
         // Get user with fallback
         $user = $this->userManager->get($uid);
-        $userPassword = '';
+
+        // Password can be empty unless first login.
+        // On first login, we cannot use a token to authenticate the user
+        // as this does not trigger creation of the user's skeleton files
+        $password = '';
 
         // Create user if not existing
         if (null === $user) {
-            $user = $this->createUser($uid);
+            // Generate random password of 30 characters
+            $password = substr(base64_encode(random_bytes(64)), 0, 30);
+
+            // Create user. This will throw if creation is not permitted.
+            $user = $this->createUser($uid, $password);
         }
 
         // Set home directory unless proxying for LDAP
@@ -132,21 +151,22 @@ class LoginService
             $this->updateUserGroups($user, $groupNames, $profile);
         }
 
-        $this->completeLogin($user, $userPassword, $userSession, $request);
+        $this->completeLogin($user, $password);
 
-        return [$user, $userPassword];
+        return [$user, $password];
     }
 
     /**
      * Log in the user to the session using the provided credentials.
      *
-     * @param IUser        $user         User object (should be non-null)
-     * @param string       $userPassword (empty unless first login)
-     * @param IUserSession $userSession
-     * @param IRequest     $request
+     * @param $user     User object (should be non-null)
+     * @param $password (empty unless first login)
      */
-    public function completeLogin($user, $userPassword, $userSession, $request)
+    public function completeLogin(IUser $user, string $password): void
     {
+        /** @var Session */
+        $userSession = \OC::$server->get(IUserSession::class);
+//
         /* On the v1 route /remote.php/webdav, a default nextcloud backend
          * tries and fails to authenticate users, then close the session.
          * This is why this check is needed.
@@ -157,31 +177,40 @@ class LoginService
         }
 
         $userSession->setTokenProvider($this->tokenProvider);
-        $userSession->createSessionToken($request, $user->getUID(), $user->getUID());
+        $userSession->createSessionToken($this->request, $user->getUID(), $user->getUID());
         $token = $this->tokenProvider->getToken($userSession->getSession()->getId());
 
+        // Log the user in. This will throw if login fails.
         $userSession->completeLogin($user, [
             'loginName' => $user->getUID(),
-            'password' => $userPassword,
-            'token' => empty($userPassword) ? $token : null,
+            'password' => $password,
+            'token' => empty($password) ? $token : null,
         ], false);
 
-        // Update the user's last login timestamp, since the conditions above tend to cause the
-        // completeLogin() call above to skip doing so.
-        $user->updateLastLoginTimestamp();
+        // Last login timestamp isn't updated when logging in with a token
+        // This will return true for first login.
+        // If the user was newly created then completeLogin will already trigger
+        // prepareUserLogin. Fortunately, the subsequent updateLastLoginTimestamp call
+        // we make here will return false then.
+        if ($user->updateLastLoginTimestamp()) { // true if first login
+            // warning: calling protected method
+            $method = (new \ReflectionClass($userSession))->getMethod('prepareUserLogin');
+            $method->setAccessible(true);
+            $method->invoke($userSession, true, false);
+        }
     }
 
     /**
      * If the LDAP backend interface is enabled, make user the
      * user actually exists in LDAP and return the uid.
      *
-     * @param null|string $ldapUid
+     * @return null|string LDAP user uid or null if not found
      *
      * @throws LoginException if LDAP backend is not enabled or user is not found
      *
      * @return null|string LDAP user uid or null if not found
      */
-    private function getLDAPUserUid($ldapUid)
+    private function getLDAPUserUid(?string $ldapUid): ?string
     {
         // Make sure we have the LDAP UID
         if (empty($ldapUid)) {
@@ -191,6 +220,7 @@ class LoginService
         // Get the LDAP user backend
         $ldap = null;
         foreach ($this->userManager->getBackends() as $backend) {
+            /** @var \OCP\IUserBackend $backend */
             if ($backend->getBackendName() === $this->config->getSystemValue('oidc_login_ldap_backend', 'LDAP')) {
                 $ldap = $backend;
             }
@@ -200,6 +230,8 @@ class LoginService
         if (null === $ldap) {
             throw new LoginException($this->l->t('No LDAP user backend found!'));
         }
+
+        /** @var \OCA\User_LDAP\IUserLDAP $ldap */
 
         // Get LDAP Access object
         $access = $ldap->getLDAPAccess($ldapUid);
@@ -217,11 +249,6 @@ class LoginService
             throw new LoginException($this->l->t('Error getting user from LDAP'));
         }
 
-        // Method no longer exists on NC 20+
-        if (method_exists($ldapUser, 'update')) {
-            $ldapUser->update();
-        }
-
         // Update the email address (#84)
         if (method_exists($ldapUser, 'updateEmail')) {
             $ldapUser->updateEmail();
@@ -235,21 +262,24 @@ class LoginService
     /**
      * Create a user if we are allowed to do that.
      *
-     * @param string $uid
+     * @return IUser Created user object
      *
      * @throws LoginException If oidc_login_disable_registration is true
      *
      * @return false|\OCP\IUser User object if created
      */
-    private function createUser($uid)
+    private function createUser(string $uid, string $password): IUser
     {
         if ($this->config->getSystemValue('oidc_login_disable_registration', true)) {
             throw new LoginException($this->l->t('Auto creating new users is disabled'));
         }
 
-        $userPassword = substr(base64_encode(random_bytes(64)), 0, 30);
+        $user = $this->userManager->createUser($uid, $password);
+        if (false === $user) {
+            throw new LoginException($this->l->t('Error creating user'));
+        }
 
-        return $this->userManager->createUser($uid, $userPassword);
+        return $user;
     }
 
     /**
@@ -260,7 +290,7 @@ class LoginService
      *
      * @throws LoginException If home directory could not be created
      */
-    private function createHomeDirectory(string $home, string $uid)
+    private function createHomeDirectory(string $home, string $uid): void
     {
         if ($this->config->getSystemValue('oidc_login_use_external_storage', false)) {
             // Check if the files external app is enabled and injected
@@ -269,7 +299,7 @@ class LoginService
             }
 
             // Check if the user already has matching storage on their root
-            $storages = array_filter($this->storagesService->getStorages(), function ($storage) use ($uid) {
+            $storages = array_filter($this->storagesService->getStorages(), static function ($storage) use ($uid) {
                 return \in_array($uid, $storage->getApplicableUsers(), true) // User must own the storage
                     && '/' === $storage->getMountPoint() // It must be mounted as root
                     && 'local' === $storage->getBackend()->getIdentifier() // It must be type local
@@ -323,18 +353,17 @@ class LoginService
 
     /**
      * Update basic profile attributes such as name and email.
-     *
-     * @param \OCP\IUser $user
-     * @param array      $profile Profile attribute values
      */
-    private function updateBasicProfile(&$user, &$profile)
+    private function updateBasicProfile(IUser $user, array $profile): void
     {
         if (null !== ($name = $this->attr->name($profile))) {
             $user->setDisplayName($name ?: $this->attr->id($profile));
         }
 
         if (null !== ($mail = $this->attr->mail($profile))) {
-            $user->setSystemEMailAddress((string) $mail);
+            if ($user->getSystemEMailAddress() !== $mail) {
+                $user->setSystemEMailAddress((string) $mail);
+            }
         }
 
         // Set quota
@@ -360,7 +389,21 @@ class LoginService
                 $image->loadFromData($raw);
 
                 $avatar = $this->avatarManager->getAvatar($user->getUid());
-                $avatar->set($image);
+                if ($avatar) {
+                    $last_modified = $avatar->getFile(64)->getMTime();
+                    $formatted_date = date('D, d M Y H:i:s \G\M\T', $last_modified);
+                    curl_setopt($curl, CURLOPT_HTTPHEADER, ["If-Modified-Since: {$formatted_date}"]);
+                }
+                $raw = curl_exec($curl);
+
+                if (200 === curl_getinfo($curl, CURLINFO_HTTP_CODE)) {
+                    $image = new \OC_Image();
+                    $image->loadFromData($raw);
+                    $image->centerCrop();
+
+                    $avatar->set($image);
+                }
+                curl_close($curl);
             } catch (\Exception $e) {
                 $this->logger->debug("Could not load image for {$user->getUid()} :  {$e->getMessage()}");
             }
@@ -368,13 +411,37 @@ class LoginService
     }
 
     /**
-     * Get list of groups of user from OIDC response.
+     * Get list of login filter values of user from OIDC response.
      *
-     * @param array $profile Profile attribute values
+     * @return string[] List of login filter values
+     */
+    private function getLoginFilterValues(array $profile): array
+    {
+        $loginFilterValues = [];
+        // Add user's login filter values from profile
+        if ($this->attr->hasLoginFilter($profile)) {
+            // Get login filter values
+            $profileLoginFilterValues = $this->attr->login_filter($profile);
+
+            // Make sure login filter allowed values names is an array
+            if (!\is_array($profileLoginFilterValues)) {
+                throw new LoginException('Login filter values field must be an array, '.\gettype($profileLoginFilterValues).' given');
+            }
+
+            // Add to all login filter values
+            $loginFilterValues = array_merge($loginFilterValues, $profileLoginFilterValues);
+        }
+
+        // Remove duplicate login filter values
+        return array_unique($loginFilterValues);
+    }
+
+    /**
+     * Get list of groups of user from OIDC response.
      *
      * @return string[] List of groups
      */
-    private function getGroupNames(&$profile)
+    private function getGroupNames(array $profile)
     {
         // Groups to add user in
         $groupNames = [];
@@ -406,24 +473,20 @@ class LoginService
         }
 
         // Remove duplicate groups
-        $groupNames = array_unique($groupNames);
-
-        return $groupNames;
+        return array_unique($groupNames);
     }
 
     /**
      * Update groups of a user to a given list of groups.
      *
-     * @param \OCP\IUser $user
-     * @param string[]   $groupNames Name of groups
-     * @param array      $profile    Profile from OIDC
+     * @param string[] $groupNames
      */
-    private function updateUserGroups(&$user, &$groupNames, &$profile)
+    private function updateUserGroups(IUser $user, array $groupNames, array $profile): void
     {
         // Remove user from groups not present
         $currentUserGroups = $this->groupManager->getUserGroups($user);
         foreach ($currentUserGroups as $currentUserGroup) {
-            if (($key = array_search($currentUserGroup->getDisplayName(), $groupNames, true)) !== false) {
+            if (($key = array_search($currentUserGroup->getGID(), $groupNames, true)) !== false) {
                 // User is already in group - don't process further
                 unset($groupNames[$key]);
             } else {
@@ -431,7 +494,7 @@ class LoginService
                 // Remove the user ONLY if we're using profile groups
                 // or the group is the `admin` group and we manage admin role
                 if ($this->attr->hasGroups($profile)
-                    || ($this->attr->managesAdmin() && 'admin' === $currentUserGroup->getDisplayName())) {
+                    || ($this->attr->managesAdmin() && 'admin' === $currentUserGroup->getGID())) {
                     $currentUserGroup->removeUser($user);
                 }
             }
@@ -454,13 +517,16 @@ class LoginService
         }
     }
 
-    private function flatten($array, $prefix = '')
+    /**
+     * Flatten an array.
+     */
+    private function flatten(array $array, string $prefix = ''): array
     {
         $result = [];
         foreach ($array as $key => $value) {
             $result[$prefix.$key] = $value;
             if (\is_array($value)) {
-                $result = $result + $this->flatten($value, $prefix.$key.'_');
+                $result += $this->flatten($value, $prefix.$key.'_');
             }
             if (\is_int($key) && \is_string($value)) {
                 $result[$prefix.$value] = $value;
